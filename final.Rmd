@@ -1,0 +1,315 @@
+---
+title: "Impact of Green Spaces on Chronic Disease Prevalence"
+author: "Sharvari Rane"
+date: "2024-03-28"
+output: html_document
+---
+
+## READ ME ##
+## TO RUN THE CODE, CHANGE PATH IN setwd("/Users/sharvarirane/Documents/sharvari/stats/stats_project/") PRESENT AT LINE 43 TO THE DESIRED WORKING DIRECTORY PATH AND THEN RUN THE CODE ##
+## USED CHAT GPT FOR SOME CODE SNIPPETS AND FRAMING OF SENTENCES IN REPORT ##
+
+```{r envSetup, include = FALSE, echo = FALSE}
+knitr::opts_chunk$set(
+    echo = TRUE,
+    message = FALSE,
+    warning = FALSE,
+    out.width = "70%",
+    fig.align = "center",
+    comment = ">",
+    tidy.opts = list(width.cutoff = 50),
+    tidy = TRUE
+    )
+```
+
+
+```{r echo = F}
+## import libraries ##
+
+library(dplyr)
+library(httr)
+library(geosphere)
+library(brms)
+library(ggplot2)
+library(gridExtra)
+library(stargazer)
+```
+
+```{r echo = F}
+## chronic diseases dataset ##
+## source: https://data.cdc.gov/500-Cities-Places/PLACES-Local-Data-for-Better-Health-Place-Data-202/eav7-hnsx/about_data ##
+
+## set homepath ##
+setwd("/Users/sharvarirane/Documents/sharvari/stats/stats_project/")
+
+## read dataset ##
+chronic_disease_df <- read.csv("./chronic_diseases_dataset.csv", stringsAsFactors = F)
+
+## filter dataset ##
+revised_cd_df <- chronic_disease_df[,c("Year","StateAbbr","LocationName","LocationID","Data_Value","Geolocation","MeasureId")]
+revised_cd_df$Geolocation <- gsub("POINT \\(|\\)", "", revised_cd_df$Geolocation)
+
+## separate into latitude longitude ##
+revised_cd_df$Latitude <- NA
+revised_cd_df$Longitude <- NA
+
+extract_lat_lon <- function(geolocation) {
+  coords <- strsplit(geolocation, " ")[[1]]
+  latitude <- as.numeric(coords[2])
+  longitude <- as.numeric(coords[1])
+  return(c(latitude, longitude))
+}
+
+coordinates <- t(apply(revised_cd_df, 1, function(row) extract_lat_lon(row["Geolocation"])))
+revised_cd_df$Latitude <- coordinates[, 1]
+revised_cd_df$Longitude <- coordinates[, 2]
+
+## finding average data of all years for same location and measure id ##
+average_data <- revised_cd_df %>%
+  group_by(MeasureId, LocationName, LocationID, StateAbbr) %>%
+  summarise(Average_Data_Value = mean(Data_Value))
+
+merged_data <- revised_cd_df %>%
+  left_join(average_data, by = c("MeasureId", "LocationName", "LocationID", "StateAbbr"))
+
+merged_data <- merged_data %>%
+  distinct(MeasureId, LocationName, Average_Data_Value, .keep_all = TRUE)
+
+merged_data <- na.omit(merged_data)
+
+measure_ids <- c("TEETHLOST", "OBESITY", "ARTHRITIS", "CASTHMA", "DIABETES")
+
+filtered_data <- merged_data %>%
+  filter(MeasureId %in% measure_ids)
+filtered_data <- filtered_data[, c("MeasureId", "Average_Data_Value", "Latitude", "Longitude", "LocationID", "StateAbbr")]
+
+## rounding to integer from percent as we want count data per 100 people ##
+filtered_data$Average_Data_Value <- round(filtered_data$Average_Data_Value)
+grouped_data <- filtered_data %>%
+  group_by(StateAbbr)
+
+## sample 30 locations from each state ##
+set.seed(1002)
+selected_locations <- grouped_data %>%
+  slice_sample(n = 30, replace = FALSE)
+
+selected_location_ids <- selected_locations$LocationID
+
+final_data <- filtered_data %>%
+  filter(LocationID %in% selected_location_ids)
+
+print(head(final_data))
+```
+
+```{r}
+## parks dataset ##
+## source: https://www.nps.gov/subjects/developer/get-started.htm ##
+## define api parameters ##
+endpoint <- "https://developer.nps.gov/api/v1/parks?limit=500"
+API_KEY <- "jmn13LRfhMaW56rVmcK89AytshzCGreqsVYwfnjk"
+headers <- c("X-Api-Key" = API_KEY)
+
+## send api request ##
+response <- GET(url = endpoint, add_headers(headers))
+data <- content(response, "parsed")
+park_data <- data$data
+
+fullNames <- c()
+latitudes <- c()
+longitudes <- c()
+
+## extract attributes from each park ##
+for (i in 1:length(park_data)) {
+  park <- park_data[[i]]
+  fullNames <- c(fullNames, park$fullName)
+  latitudes <- c(latitudes, park$latitude)
+  longitudes <- c(longitudes, park$longitude)
+}
+
+park_df <- data.frame(fullName = fullNames,
+                      latitude = latitudes,
+                      longitude = longitudes)
+
+## remove one blank datapoint ##
+park_df <- park_df[-46,]
+print(head(park_df))
+
+#write.csv(park_df, "./parks.csv"), quote = T)
+
+```
+
+```{r}
+
+## caculate minimum distance between the location of chronic disease prevalence and nearest park location ##
+coords_filtered <- final_data[,c("Longitude", "Latitude")]
+coords_filtered$Longitude <- as.numeric(coords_filtered$Longitude)
+coords_filtered$Latitude <- as.numeric(coords_filtered$Latitude)
+coords_filtered <- coords_filtered %>%
+  distinct()
+
+coords_park <- park_df[,c("longitude", "latitude")]
+coords_park$longitude <- as.numeric(coords_park$longitude)
+coords_park$latitude <- as.numeric(coords_park$latitude)
+
+coords_filtered <- na.omit(coords_filtered)
+coords_park <- na.omit(coords_park)
+
+## using distm function with Vincety Ellipsoid method to calculate distance between two locations given latitude and longitude ##
+distances <- distm(coords_filtered, coords_park, fun = distVincentyEllipsoid)
+
+## find minimum distance i.e. distance to the nearest park ##
+min_distances <- apply(distances, 1, min)
+
+coords_filtered$min_distance <- min_distances
+
+## merge coordinates minimum distance with final chronic disease dataset by latitude longitude ##
+final_merged_data <- merge(final_data, coords_filtered, by = c("Longitude", "Latitude"))
+
+## normalize minimum distance ##
+normalize <- function(x) {
+  (x - min(x)) / (max(x) - min(x))
+}
+
+## remote score, ranges from 0 to 1, 1 <- park is remote or far away from location of disease, 0 <- park is near the location of disease ##
+final_merged_data$remote_score <- normalize(final_merged_data$min_distance)
+
+## convert double type into integer ##
+final_merged_data$Average_Data_Value <- as.integer(final_merged_data$Average_Data_Value)
+
+print(head(final_merged_data))
+
+```
+
+```{r}
+## regression ##
+
+## x = remote_score (1 <- park is remote or far away from location of disease, 0 <- park is near the location of disease), y  = Average_Data_Value (population per 100 having disease) ##
+
+## simple linear regression model ##
+model_0_a <- lm(Average_Data_Value ~ remote_score, data = final_merged_data)
+summary(model_0_a)
+
+## simple linear regression model with categories ##
+model_0_b <- lm(Average_Data_Value ~ remote_score + I(MeasureId), data = final_merged_data)
+summary(model_0_b)
+
+## simple linear regression model with interaction ##
+model_0_c <- lm(Average_Data_Value ~ remote_score * I(MeasureId), data = final_merged_data)
+summary(model_0_c)
+
+## using brms poisson distribution since outcome is count data ##
+model_1 <- brm(Average_Data_Value ~ remote_score, data = final_merged_data, family = "poisson", chains = 2, core = 2, iter = 2000)
+summary(model_1)
+
+## categorize measure ids i.e. types of diseases ##
+model_2 <- brm(Average_Data_Value ~ remote_score + I(MeasureId), data = final_merged_data, family = "poisson", chains = 2, core = 2, iter = 2000)
+summary(model_2)
+
+## varying slope interaction ##
+model_3 <- brm(Average_Data_Value ~ remote_score + I(MeasureId) + remote_score:I(MeasureId), data = final_merged_data, family = "poisson", chains = 2, core = 2, iter = 2000)
+summary(model_3)
+
+## stargazer view ##
+formatted_model <- stargazer(list(model_0_a, model_0_b, model_0_c), type = "text")
+
+## comparing model_1, model_2 and model_3 with loo ##
+
+loo_model_1 <- loo(model_1)
+loo_model_2 <- loo(model_2)
+loo_model_3 <- loo(model_3)
+
+loo_compare(loo_model_1, loo_model_2, loo_model_3)
+```
+
+```{r}
+## visualization ##
+
+library(ggplot2)
+library(gridExtra)
+
+## create a scatterplot matrix ##
+measure_ids <- c("TEETHLOST", "OBESITY", "ARTHRITIS", "CASTHMA", "DIABETES")
+colours_list <- c("blue","green","orange","yellow","maroon")
+
+## for each measure id a scatterplot ##
+i = 0
+list_plots <- c()
+for(id in measure_ids){
+  i = i+1
+  final_merged_data_plot <- final_merged_data[final_merged_data$MeasureId == id,]
+  list_plots[[i]] <- ggplot(final_merged_data_plot, aes(x = remote_score, y = Average_Data_Value, color = MeasureId)) +
+    geom_point() +
+    geom_smooth(method = "lm", se = FALSE, aes(group = MeasureId, color = "black")) +
+    scale_color_manual(values = setNames(colours_list[i], id)) +
+    labs(title = paste0(id),
+         x = "Remote Score",
+         y = "% People having Disease")
+}
+
+grid.arrange(grobs = list_plots, ncol = 3)
+```
+
+```{r}
+## air quality ##
+## using air quality data for every state as a prior, as bad air quality leads to worsened health ##
+## https://aqs.epa.gov/aqsweb/airdata/download_files.html#Annual ##
+air_quality_df <- read.csv("./annual_conc_by_monitor_2021.csv", stringsAsFactors = F)
+air_quality_df <- air_quality_df[air_quality_df$Sample.Duration == "1 HOUR",]
+air_quality_df <- air_quality_df[,c("State.Name","Arithmetic.Mean","Parameter.Name")]
+
+## consider so2 and co levels ##
+so2_df <- air_quality_df[air_quality_df$Parameter.Name == "Sulfur dioxide",]
+co_df <- air_quality_df[air_quality_df$Parameter.Name == "Carbon monoxide",]
+
+so2_avg_aqi <- so2_df %>%
+  group_by(State.Name) %>%
+  summarise(Average_Arithmetic_Mean = mean(Arithmetic.Mean, na.rm = TRUE))
+
+co_avg_aqi <- co_df %>%
+  group_by(State.Name) %>%
+  summarise(Average_Arithmetic_Mean = mean(Arithmetic.Mean, na.rm = TRUE))
+
+
+## mapping state abbr ##
+state_abbr <- read.csv("./states.csv", stringsAsFactors = F)
+
+so2_avg_aqi <- merge(so2_avg_aqi, state_abbr, by.x = "State.Name", by.y = "State", keep.all = T )
+colnames(so2_avg_aqi) <- c("State.Name", "SO2", "Abbreviation")
+
+co_avg_aqi <- merge(co_avg_aqi, state_abbr, by.x = "State.Name", by.y = "State", keep.all = T )
+colnames(co_avg_aqi) <- c("State.Name", "CO", "Abbreviation")
+
+final_merged_data_aqi <- merge(final_merged_data, so2_avg_aqi, by.x = "StateAbbr", by.y = "Abbreviation", keep.all = T )
+final_merged_data_aqi <- merge(final_merged_data_aqi, co_avg_aqi, by.x = "StateAbbr", by.y = "Abbreviation", keep.all = T )
+
+```
+
+```{r}
+## so2 - distribution with all states ##
+mean_value_so2 <- mean(final_merged_data_aqi$SO2)
+sd_value_so2 <- sd(final_merged_data_aqi$SO2)
+
+prior_SO2_state <- set_prior(paste("normal(", mean_value_so2, ",", sd_value_so2, ")", sep = ""), class = "b", coef = "SO2")
+
+model_4_a <- brm(Average_Data_Value ~ remote_score + I(MeasureId) + SO2 + remote_score:I(MeasureId):SO2 + (1 | StateAbbr) , data = final_merged_data_aqi, prior = prior_SO2_state, family = "poisson", chains = 2, core = 2, iter = 2000)
+summary(model_4_a)
+ranef(model_4_a)
+
+## co - distribution with all states ##
+mean_value_co <- mean(final_merged_data_aqi$CO)
+sd_value_co <- sd(final_merged_data_aqi$CO)
+
+prior_CO_state <- set_prior(paste("normal(", mean_value_co, ",", sd_value_co, ")", sep = ""), class = "b", coef = "CO")
+
+model_4_b <- brm(Average_Data_Value ~ remote_score + I(MeasureId) + CO + remote_score:I(MeasureId):CO + (1 | StateAbbr) , data = final_merged_data_aqi, prior = prior_CO_state, family = "poisson", chains = 2, core = 2, iter = 2000)
+summary(model_4_b)
+ranef(model_4_b)
+
+## comparing model_3, model_4_a and model_4_b with loo ##
+
+loo_model_4_a <- loo(model_4_a)
+loo_model_4_b <- loo(model_4_b)
+
+loo_compare(loo_model_3, loo_model_4_a, loo_model_4_b)
+
+```
