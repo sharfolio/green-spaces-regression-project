@@ -1,4 +1,4 @@
-# green-spaces-regression-project
+# README: Impact of Green Spaces on Chronic Disease Prevalence
 
 # Introduction
 
